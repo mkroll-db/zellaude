@@ -29,11 +29,20 @@ HOOK_ENTRY=$(jq -nc --arg cmd "$HOOK_SCRIPT" '[{
 
 EVENTS='["PreToolUse","PostToolUse","PostToolUseFailure","UserPromptSubmit","PermissionRequest","Notification","Stop","SubagentStop","SessionStart","SessionEnd"]'
 
+backup_settings() {
+  if [ -f "$SETTINGS" ]; then
+    cp "$SETTINGS" "$SETTINGS.bak"
+    echo "Backed up $SETTINGS to $SETTINGS.bak"
+  fi
+}
+
 uninstall() {
   if [ ! -f "$SETTINGS" ]; then
     echo "No settings file found at $SETTINGS"
     exit 0
   fi
+
+  backup_settings
 
   # Remove only zellaude hook entries (those matching our script path)
   local tmp
@@ -44,7 +53,8 @@ uninstall() {
         .value |= [
           .[] | . as $group |
           ($group.hooks // []) | map(select(.command != $cmd)) |
-          if length > 0 then ($group | .hooks = .) else empty end
+          . as $filtered |
+          if length > 0 then ($group | .hooks = $filtered) else empty end
         ]
       ) | .hooks |= with_entries(select(.value | length > 0)) |
       if .hooks == {} then del(.hooks) else . end
@@ -60,6 +70,8 @@ install() {
     mkdir -p "$(dirname "$SETTINGS")"
     echo '{}' > "$SETTINGS"
   fi
+
+  backup_settings
 
   # First uninstall any existing zellaude hooks to avoid duplicates
   uninstall 2>/dev/null || true

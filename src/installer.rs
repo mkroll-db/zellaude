@@ -45,6 +45,9 @@ if [ ! -f "$SETTINGS" ]; then
   echo '{}' > "$SETTINGS"
 fi
 
+# Back up settings before modifying
+cp "$SETTINGS" "$SETTINGS.bak"
+
 # Remove ALL existing zellaude hook entries (any path ending in zellaude-hook.sh)
 tmp=$(mktemp)
 jq '
