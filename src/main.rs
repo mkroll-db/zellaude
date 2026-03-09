@@ -32,7 +32,6 @@ impl ZellijPlugin for State {
             EventType::RunCommandResult,
             EventType::PermissionRequestResult,
         ]);
-        set_selectable(false);
         set_timeout(TIMER_INTERVAL);
 
         // Load persisted settings (may be retried in PermissionRequestResult
@@ -156,6 +155,9 @@ impl ZellijPlugin for State {
                 has_flashes || stale_changed || flash_changed || self.has_elapsed_display()
             }
             Event::PermissionRequestResult(_) => {
+                // Now that permissions are granted, mark as non-selectable
+                // so the plugin stays visible during fullscreen
+                set_selectable(false);
                 // Permissions granted — ask existing instances for their state
                 self.request_sync();
                 // Retry config load (the one in load() may have been dropped
