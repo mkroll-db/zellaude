@@ -244,6 +244,11 @@ def handle_connection(conn: socket.socket, addr: tuple, backend: str,
             conn.close()
             return
 
+        if first_byte[0] != 0x16 and tls_ctx and not addr[0] in ("127.0.0.1", "::1"):
+            log(f"Rejected plain TCP from {addr[0]} (TLS required for non-localhost)")
+            conn.close()
+            return
+
         if first_byte[0] == 0x16:
             if not tls_ctx:
                 log(f"TLS connection from {addr[0]} but TLS not configured, rejecting")
@@ -407,7 +412,7 @@ def _sign_csr_with_openssl(csr_pem: str, tls_dir: str, name: str) -> str | None:
     try:
         subprocess.run(
             [
-                "openssl", "x509", "-req",
+                _find_openssl(), "x509", "-req",
                 "-in", csr_path,
                 "-CA", ca_cert,
                 "-CAkey", ca_key,
@@ -643,13 +648,14 @@ def cmd_pair(args: argparse.Namespace) -> None:
 
     os.makedirs(tls_dir, exist_ok=True)
 
-    # Generate client key + CSR
+    # Generate client key + CSR (Ed25519 by default)
     key_path = os.path.join(tls_dir, f"{name}-key.pem")
     csr_path = os.path.join(tls_dir, f"{name}.csr")
 
+    _gen_key(KEYTYPE_ED25519, key_path)
     subprocess.run(
-        ["openssl", "req", "-new", "-newkey", "rsa:2048",
-         "-nodes", "-keyout", key_path, "-out", csr_path, "-subj", f"/CN={name}"],
+        [_find_openssl(), "req", "-new", "-key", key_path,
+         "-out", csr_path, "-subj", f"/CN={name}"],
         check=True, capture_output=True,
     )
     os.chmod(key_path, 0o600)
@@ -737,31 +743,100 @@ def cmd_pair(args: argparse.Namespace) -> None:
 
 # --- Certificate generation (openssl CLI) ---
 
+KEYTYPE_ED25519 = "ed25519"
+KEYTYPE_RSA = "rsa:2048"
+
+_openssl_bin: str | None = None
+
+
+def _find_openssl() -> str:
+    """Find an OpenSSL binary, preferring Homebrew's over system LibreSSL."""
+    global _openssl_bin
+    if _openssl_bin:
+        return _openssl_bin
+
+    # Homebrew paths (Apple Silicon, Intel)
+    for brew_path in (
+        "/opt/homebrew/bin/openssl",
+        "/opt/homebrew/opt/openssl/bin/openssl",
+        "/usr/local/opt/openssl/bin/openssl",
+        "/usr/local/bin/openssl",
+    ):
+        if os.path.isfile(brew_path):
+            _openssl_bin = brew_path
+            return _openssl_bin
+
+    # Fall back to PATH
+    path = shutil.which("openssl")
+    if path:
+        _openssl_bin = path
+        return _openssl_bin
+
+    print("Error: openssl CLI not found", file=sys.stderr)
+    sys.exit(1)
+
+
+def _gen_key(keytype: str, key_path: str) -> str:
+    """Generate a private key file. Returns the actual keytype used (may fall back to RSA)."""
+    if keytype == KEYTYPE_ED25519:
+        result = subprocess.run(
+            [_find_openssl(), "genpkey", "-algorithm", "ed25519", "-out", key_path],
+            capture_output=True,
+        )
+        if result.returncode == 0:
+            os.chmod(key_path, 0o600)
+            return KEYTYPE_ED25519
+        # Ed25519 not supported (e.g. LibreSSL), fall back to RSA
+        print(f"Warning: Ed25519 not supported by openssl, falling back to RSA", file=sys.stderr)
+        keytype = KEYTYPE_RSA
+    subprocess.run(
+        [_find_openssl(), "genrsa", "-out", key_path, "2048"],
+        check=True, capture_output=True,
+    )
+    os.chmod(key_path, 0o600)
+    return KEYTYPE_RSA
+
+
+def _read_keytype(tls_dir: str) -> str:
+    """Read stored key type, default to ed25519."""
+    kt_path = os.path.join(tls_dir, ".keytype")
+    if os.path.exists(kt_path):
+        with open(kt_path) as f:
+            return f.read().strip()
+    return KEYTYPE_ED25519
+
+
+def _write_keytype(tls_dir: str, keytype: str) -> None:
+    with open(os.path.join(tls_dir, ".keytype"), "w") as f:
+        f.write(keytype)
+
+
 def cmd_gen_cert(args: argparse.Namespace) -> None:
-    if not shutil.which("openssl"):
-        print("Error: openssl CLI required", file=sys.stderr)
-        sys.exit(1)
+    _find_openssl()  # verify available
 
     tls_dir = args.tls_dir
     os.makedirs(tls_dir, exist_ok=True)
+
+    keytype = KEYTYPE_RSA if args.tls_fallback else KEYTYPE_ED25519
 
     if args.ca:
         ca_key = os.path.join(tls_dir, "ca-key.pem")
         ca_cert = os.path.join(tls_dir, "ca.pem")
 
-        # Generate CA
+        # Generate CA key + self-signed cert
+        keytype = _gen_key(keytype, ca_key)
         subprocess.run(
-            ["openssl", "req", "-x509", "-new", "-newkey", "rsa:2048",
-             "-nodes", "-keyout", ca_key, "-out", ca_cert, "-days", "3650",
-             "-subj", "/CN=zellaude-ca"],
+            [_find_openssl(), "req", "-x509", "-new", "-key", ca_key,
+             "-out", ca_cert, "-days", "3650", "-subj", "/CN=zellaude-ca"],
             check=True, capture_output=True,
         )
-        os.chmod(ca_key, 0o600)
+        _write_keytype(tls_dir, keytype)
         print(f"CA certificate: {ca_cert}")
         print(f"CA private key: {ca_key}")
+        print(f"Key type: {keytype}")
 
         # Generate server cert signed by CA
-        _gen_signed_cert_openssl("server", tls_dir)
+        _gen_signed_cert_openssl("server", tls_dir, keytype)
     else:
         name = args.name
         if not name:
@@ -774,10 +849,12 @@ def cmd_gen_cert(args: argparse.Namespace) -> None:
             print(f"Error: CA not found in {tls_dir}. Run with --ca first.", file=sys.stderr)
             sys.exit(1)
 
-        _gen_signed_cert_openssl(name, tls_dir)
+        # Use the key type that was used for the CA
+        keytype = _read_keytype(tls_dir)
+        _gen_signed_cert_openssl(name, tls_dir, keytype)
 
 
-def _gen_signed_cert_openssl(name: str, tls_dir: str) -> None:
+def _gen_signed_cert_openssl(name: str, tls_dir: str, keytype: str) -> None:
     ca_key = os.path.join(tls_dir, "ca-key.pem")
     ca_cert = os.path.join(tls_dir, "ca.pem")
     key_path = os.path.join(tls_dir, f"{name}-key.pem")
@@ -785,13 +862,12 @@ def _gen_signed_cert_openssl(name: str, tls_dir: str) -> None:
     csr_path = os.path.join(tls_dir, f"{name}.csr")
 
     # Generate key + CSR
+    _gen_key(keytype, key_path)
     subprocess.run(
-        ["openssl", "req", "-new", "-newkey", "rsa:2048",
-         "-nodes", "-keyout", key_path, "-out", csr_path,
-         "-subj", f"/CN={name}"],
+        [_find_openssl(), "req", "-new", "-key", key_path,
+         "-out", csr_path, "-subj", f"/CN={name}"],
         check=True, capture_output=True,
     )
-    os.chmod(key_path, 0o600)
 
     # Sign with CA — try with SAN extensions first, fall back without
     ext_file = csr_path + ".ext"
@@ -799,7 +875,7 @@ def _gen_signed_cert_openssl(name: str, tls_dir: str) -> None:
         f.write(f"subjectAltName=DNS:{name},DNS:localhost,IP:127.0.0.1\n")
 
     sign_cmd = [
-        "openssl", "x509", "-req", "-in", csr_path,
+        _find_openssl(), "x509", "-req", "-in", csr_path,
         "-CA", ca_cert, "-CAkey", ca_key, "-CAserial", os.path.join(tls_dir, "ca.srl"), "-CAcreateserial",
         "-out", cert_path, "-days", "3650", "-sha256",
     ]
@@ -880,6 +956,8 @@ def main() -> None:
     cert_p.add_argument("--name", default=None, help="client certificate name")
     cert_p.add_argument("--tls-dir", default=DEFAULT_TLS_DIR,
                         help=f"output directory (default: {DEFAULT_TLS_DIR})")
+    cert_p.add_argument("--tls-fallback", action="store_true",
+                        help="use RSA instead of Ed25519 (for older OpenSSL/LibreSSL)")
 
     args = parser.parse_args()
 
