@@ -95,7 +95,7 @@ if [ "$HOOK_EVENT" = "PermissionRequest" ]; then
     MESSAGE="Permission requested${TOOL_SUFFIX}"
 
     # Rate-limit: one notification per pane per 10 seconds
-    LOCK="/tmp/zellaude-notify-${ZELLIJ_PANE_ID}"
+    LOCK="${XDG_RUNTIME_DIR:-/tmp}/zellaude-notify-${ZELLIJ_PANE_ID}"
     NOW=$(date +%s)
     LAST=0
     [ -f "$LOCK" ] && LAST=$(cat "$LOCK" 2>/dev/null)
@@ -103,30 +103,46 @@ if [ "$HOOK_EVENT" = "PermissionRequest" ]; then
       echo "$NOW" > "$LOCK"
 
       # Click callback: activate terminal + focus the pane
+      # Escape single quotes in variables to prevent shell injection
+      escape_sq() { printf '%s' "$1" | sed "s/'/'\\\\''/g"; }
       ZELLIJ_BIN=$(command -v zellij)
-      FOCUS_CMD="${ZELLIJ_BIN} -s '${ZELLIJ_SESSION_NAME}' pipe --name zellaude:focus -- ${ZELLIJ_PANE_ID}"
+      FOCUS_CMD="${ZELLIJ_BIN} -s '$(escape_sq "$ZELLIJ_SESSION_NAME")' pipe --name zellaude:focus -- ${ZELLIJ_PANE_ID}"
 
-      case "$(uname)" in
-        Darwin)
-          [ -n "${TERM_PROGRAM:-}" ] && FOCUS_CMD="open -a '${TERM_PROGRAM}' && ${FOCUS_CMD}"
-          if command -v terminal-notifier >/dev/null 2>&1; then
-            terminal-notifier \
-              -title "$TITLE" \
-              -message "$MESSAGE" \
-              -execute "$FOCUS_CMD" &
-          else
-            osascript -e "display notification \"$MESSAGE\" with title \"$TITLE\"" &
-          fi
-          ;;
-        Linux)
-          if command -v notify-send >/dev/null 2>&1; then
-            notify-send "$TITLE" "$MESSAGE" &
-          fi
-          ;;
-      esac
+      # Try notify server first (for SSH remote → laptop notifications)
+      NOTIFY_PORT="${ZELLAUDE_NOTIFY_PORT:-2365}"
+      NOTIFY_JSON=$(jq -nc --arg t "$TITLE" --arg m "$MESSAGE" --arg p "$ZELLIJ_PANE_ID" \
+        '{title: $t, message: $m, pane_id: $p}')
+      if printf '%s' "$NOTIFY_JSON" | nc -w 1 127.0.0.1 "$NOTIFY_PORT" >/dev/null 2>&1; then
+        : # sent to notify server
+      else
+        # Fall back to local desktop notification
+        case "$(uname)" in
+          Darwin)
+            [ -n "${TERM_PROGRAM:-}" ] && FOCUS_CMD="open -a '$(escape_sq "${TERM_PROGRAM}")' && ${FOCUS_CMD}"
+            if command -v terminal-notifier >/dev/null 2>&1; then
+              terminal-notifier \
+                -title "$TITLE" \
+                -message "$MESSAGE" \
+                -execute "$FOCUS_CMD" &
+            else
+              # Pass values via argv to avoid AppleScript injection
+              osascript -e 'on run argv' \
+                -e 'display notification (item 2 of argv) with title (item 1 of argv)' \
+                -e 'end run' \
+                -- "$TITLE" "$MESSAGE" &
+            fi
+            ;;
+          Linux)
+            if command -v notify-send >/dev/null 2>&1; then
+              notify-send "$TITLE" "$MESSAGE" &
+            fi
+            ;;
+        esac
+      fi
     fi
   fi
 fi
 
 # Send to plugin (hook is already async, no need to background)
 zellij pipe --name "zellaude" -- "$PAYLOAD"
+
