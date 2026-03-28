@@ -52,6 +52,7 @@ DEFAULT_TLS_DIR = os.path.expanduser("~/.config/zellaude/certs")
 
 last_notify: dict[str, float] = {}
 log_file = None
+log_stdout = False
 
 
 def log(msg: str) -> None:
@@ -59,7 +60,7 @@ def log(msg: str) -> None:
     if log_file:
         with open(log_file, "a") as f:
             f.write(line + "\n")
-    else:
+    if not log_file or log_stdout:
         print(line, flush=True)
 
 
@@ -487,8 +488,9 @@ def approval_input_loop():
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
-    global log_file, bind_host
+    global log_file, log_stdout, bind_host
     log_file = args.log
+    log_stdout = getattr(args, "stdout", False)
     bind_host = args.host
     backend = args.backend or detect_backend()
 
@@ -551,8 +553,9 @@ def cmd_serve(args: argparse.Namespace) -> None:
 # --- Client mode ---
 
 def cmd_connect(args: argparse.Namespace) -> None:
-    global log_file
+    global log_file, log_stdout
     log_file = args.log
+    log_stdout = getattr(args, "stdout", False)
     backend = args.backend or detect_backend()
 
     host, port = args.host, args.port
@@ -919,6 +922,8 @@ def main() -> None:
     serve_p.add_argument("--port", type=int, default=2365, help="listen port (default: 2365)")
     serve_p.add_argument("--pid", default="/tmp/zellaude-notify.pid", help="pid file path")
     serve_p.add_argument("--log", default=None, help="log file path (default: stdout)")
+    serve_p.add_argument("-c", "--stdout", action="store_true",
+                         help="also print to stdout when --log is set")
     serve_p.add_argument("--backend", default=None,
                          choices=["osascript", "terminal-notifier", "termux", "notify-send", "none"],
                          help="notification backend (default: auto-detect)")
@@ -929,6 +934,8 @@ def main() -> None:
     conn_p.add_argument("--host", default="localhost", help="server host (default: localhost)")
     conn_p.add_argument("--port", type=int, default=2365, help="server port (default: 2365)")
     conn_p.add_argument("--log", default=None, help="log file path (default: stdout)")
+    conn_p.add_argument("-c", "--stdout", action="store_true",
+                         help="also print to stdout when --log is set")
     conn_p.add_argument("--backend", default=None,
                          choices=["osascript", "terminal-notifier", "termux", "notify-send", "none"],
                          help="notification backend (default: auto-detect)")
